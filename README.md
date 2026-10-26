@@ -1,0 +1,87 @@
+# agentread
+
+Read a URL your own fetch failed on, and get the page text back — or a clear verdict on why it can't be read.
+
+An agent hits a 403, a 429, an empty body, or a JavaScript shell. Instead of retrying blindly, it calls `agentread` with that URL and gets either the page text as markdown, or a verdict telling it to stop and try a different route.
+
+## Endpoint
+
+Base: `https://agentread.midi-thumb.workers.dev`
+
+| Call | What it does |
+|---|---|
+| `GET /read?url=…` | Read one URL |
+| `POST /read {"urls":[…]}` | Read up to 40 in one call |
+| `GET /` · `/mcp` · `/llms.txt` | Free tool manifest |
+
+```bash
+curl "https://agentread.midi-thumb.workers.dev/read?url=https://example.com/"
+```
+
+```json
+{
+  "url": "https://example.com/",
+  "title": "Example Domain",
+  "text": "Example Domain This domain is for use in documentation examples…",
+  "chars": 171,
+  "verdict": "readable",
+  "recommended_route": "direct_fetch",
+  "robots_disallowed": false,
+  "evidence": { "http_status": 200, "content_type": "text/html", "bytes": 577 }
+}
+```
+
+When it cannot read a page it says so, and says why:
+
+```json
+{ "verdict": "blocked", "recommended_route": "render", "text": null,
+  "evidence": { "http_status": 403 } }
+```
+
+Verdicts: `readable` · `blocked` · `needs_javascript` · `paywalled`.
+Routes: `direct_fetch` · `render` · `find_mirror` · `do_not_fetch`.
+
+## What it actually does, measured
+
+Tested against 9 real sites: **4 returned page text.**
+
+| Site | Result |
+|---|---|
+| example.com | readable |
+| en.wikipedia.org | readable (8000 chars) |
+| x.com | readable |
+| docs.stripe.com | readable |
+| github.com | flaky — sometimes 429 |
+| news.ycombinator.com | blocked (419) |
+| reddit.com | blocked (empty shell) |
+| nytimes.com | blocked (403) |
+| amazon.com | blocked |
+
+**It does not bypass bot protection.** It runs on Cloudflare Workers, whose egress IPs are shared and widely blocked. Pages behind hard bot walls report `blocked` — that answer is accurate and still useful, because it stops an agent burning calls, but it is not the text.
+
+## Pricing
+
+$0.02 per URL over x402 (USDC on Base). Batches are priced per URL. While `PAY_TO` is unset the service runs free — see `PAY_TO` below.
+
+## Deploy your own
+
+```bash
+npx wrangler deploy worker.js --name agentread --compatibility-date 2026-10-19
+```
+
+Set a wallet to start charging:
+
+```bash
+npx wrangler secret put PAY_TO   # or a [vars] entry with your EVM address
+```
+
+With no `PAY_TO`, every request is free and responses carry `"dry": true`.
+
+## Tests
+
+```bash
+node test.mjs        # 5 real sites, asserts verdicts
+node test-http.mjs   # 9 checks: paywall, batch pricing, cache, blocked pages
+```
+
+No dependencies — Node 18+ (global `fetch`) and the standard library only.
