@@ -116,6 +116,56 @@ function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
 }
 
+const OPENAPI = {
+  openapi: "3.1.0",
+  info: {
+    title: "agentread",
+    version: "0.1.0",
+    description:
+      "Read a URL your own fetch failed on and get the page text back, or a verdict explaining why " +
+      "it cannot be read. Built for agents that just got a 403, 429, empty body or JS shell.",
+    "x-guidance":
+      "Call POST /read with {url} after your own fetch fails. You get back {title, text, verdict, " +
+      "recommended_route}. If verdict is 'readable', use text. If it is blocked/needs_javascript/" +
+      "paywalled, stop retrying and follow recommended_route. POST {urls:[...]} checks up to 40 " +
+      "URLs in one paid call, priced per URL. Pages behind hard bot walls will report 'blocked' " +
+      "rather than return fabricated content.",
+  },
+  paths: {
+    "/read": {
+      post: {
+        operationId: "read",
+        summary: "Read one or more URLs",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  url: { type: "string", description: "Single URL to read (http/https)" },
+                  urls: { type: "array", items: { type: "string" },
+                          description: "Up to 40 URLs in one call, priced per URL" },
+                },
+                additionalProperties: false,
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "Page text, or a verdict explaining why it is unreadable" },
+          "400": { description: "Missing or invalid url" },
+          "402": { description: "Payment Required" },
+        },
+        "x-payment-info": {
+          price: { mode: "fixed", currency: "USD", amount: "0.02" },
+          protocols: [{ x402: {} }],
+        },
+      },
+    },
+  },
+};
+
 const MCP_TOOL = {
   name: "read",
   description: MANIFEST.tools[0].description,
@@ -194,6 +244,7 @@ export default {
     const path = url.pathname;
 
     if (path === "/mcp" && req.method === "POST") return mcp(req, dry, PRICE, payTo, ctx); // MCP JSON-RPC
+    if (path === "/openapi.json") return json(OPENAPI); // discovery contract for x402 registries
     if (["/", "/mcp", "/llms.txt", "/api/resources.json"].includes(path)) return json(MANIFEST);
     if (path !== "/read") return json({ error: "not found" }, 404);
 
