@@ -116,13 +116,86 @@ function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
 }
 
+const MCP_TOOL = {
+  name: "read",
+  description: MANIFEST.tools[0].description,
+  inputSchema: {
+    type: "object",
+    properties: {
+      url: { type: "string", description: "The URL to read" },
+      urls: { type: "array", items: { type: "string" }, description: "Up to 40 URLs in one call" },
+    },
+  },
+};
+
+// one read path, used by both the REST route and MCP tools/call
+async function runRead({ target, urls }, dry, charge, ctx) {
+  if (target && !/^https?:\/\//.test(target)) return [400, { error: "url required (http/https)" }];
+  if (!target && !(urls && urls.length)) return [400, { error: "url required (http/https)" }];
+  const cache = caches.default;
+  const one = async (t) => {
+    const key = new Request("https://agentread.internal/" + VERSION + "/" + t, { method: "GET" });
+    const hit = await cache.match(key);
+    if (hit) return { ...(await hit.json()), cached: true };
+    const out = await readPage(t);
+    out.cached = false;
+    out.checked_at = new Date().toISOString();
+    if (dry) out.dry = true;
+    ctx.waitUntil(cache.put(key, new Response(JSON.stringify(out), {
+      headers: { "content-type": "application/json", "cache-control": "max-age=3600" },
+    })));
+    return out;
+  };
+  if (urls) {
+    const results = await Promise.all(urls.map(one)); // 40 in parallel, each cached per URL
+    return [200, { count: results.length, charged: dry ? 0 : charge, results }];
+  }
+  return [200, await one(target)];
+}
+
+async function mcp(req, dry, charge, payTo, ctx) {
+  const msg = await req.json().catch(() => null);
+  const id = msg && msg.id !== undefined ? msg.id : null;
+  const ok = (result) => json({ jsonrpc: "2.0", id, result });
+  if (!msg || msg.jsonrpc !== "2.0") {
+    return json({ jsonrpc: "2.0", id, error: { code: -32700, message: "parse error" } }, 400);
+  }
+  switch (msg.method) {
+    case "initialize":
+      return ok({ protocolVersion: "2024-11-05", capabilities: { tools: {} },
+                  serverInfo: { name: "agentread", version: "0.1.0" } });
+    case "notifications/initialized":
+      return new Response(null, { status: 202 });
+    case "ping":
+      return ok({});
+    case "tools/list":
+      return ok({ tools: [MCP_TOOL] });
+    case "tools/call": {
+      if (!req.headers.get("x-payment") && !dry) {
+        return json({ jsonrpc: "2.0", id, error: { code: -32001, message: "payment_required",
+          data: { accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: charge, payTo }] } } }, 402);
+      }
+      const a = (msg.params || {}).arguments || {};
+      const urls = Array.isArray(a.urls)
+        ? a.urls.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)).slice(0, 40) : null;
+      const [code, body] = await runRead({ target: a.url, urls }, dry, charge, ctx);
+      return ok({ content: [{ type: "text", text: JSON.stringify(body) }], isError: code !== 200 });
+    }
+    default:
+      return json({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } }, 200);
+  }
+}
+
 export default {
   async fetch(req, env, ctx) {
     const payTo = (env && env.PAY_TO) || PAY_TO;
     const dry = payTo === ZERO; // no wallet configured => free + logged, real traffic data
     const url = new URL(req.url);
-    if (["/", "/mcp", "/llms.txt", "/api/resources.json"].includes(url.pathname)) return json(MANIFEST);
-    if (url.pathname !== "/read") return json({ error: "not found" }, 404);
+    const path = url.pathname;
+
+    if (path === "/mcp" && req.method === "POST") return mcp(req, dry, PRICE, payTo, ctx); // MCP JSON-RPC
+    if (["/", "/mcp", "/llms.txt", "/api/resources.json"].includes(path)) return json(MANIFEST);
+    if (path !== "/read") return json({ error: "not found" }, 404);
 
     let target = url.searchParams.get("url");
     let urls = null;
@@ -131,35 +204,13 @@ export default {
       target = b.url || target;
       if (Array.isArray(b.urls)) urls = b.urls.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)).slice(0, 40);
     }
-    if (target && !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
-    if (!target && !(urls && urls.length)) return json({ error: "url required (http/https)" }, 400);
-
     const count = urls && urls.length ? urls.length : 1;
     const charge = +(PRICE * count).toFixed(4);
     if (!req.headers.get("x-payment") && !dry) {
       return json({ error: "payment_required",
         accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: charge, payTo }] }, 402);
     }
-
-    const cache = caches.default;
-    const one = async (t) => {
-      const key = new Request("https://agentread.internal/" + VERSION + "/" + t, { method: "GET" });
-      const hit = await cache.match(key);
-      if (hit) return { ...(await hit.json()), cached: true };
-      const out = await readPage(t);
-      out.cached = false;
-      out.checked_at = new Date().toISOString();
-      if (dry) out.dry = true;
-      ctx.waitUntil(cache.put(key, new Response(JSON.stringify(out), {
-        headers: { "content-type": "application/json", "cache-control": "max-age=3600" },
-      })));
-      return out;
-    };
-
-    if (urls) {
-      const results = await Promise.all(urls.map(one)); // 40 in parallel, each cached per URL
-      return json({ count: results.length, charged: dry ? 0 : charge, results });
-    }
-    return json(await one(target));
+    const [code, body] = await runRead({ target, urls }, dry, charge, ctx);
+    return json(body, code);
   },
 };
