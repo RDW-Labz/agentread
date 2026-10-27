@@ -53,7 +53,9 @@ const hdr = resp.headers.get("payment-required");
 const decoded = hdr ? JSON.parse(Buffer.from(hdr, "base64").toString("utf8")) : null;
 check("payment-required header is canonical v2",
   !!decoded && decoded.x402Version === 2 && decoded.accepts[0].network === "eip155:8453"
-  && decoded.accepts[0].asset.startsWith("0x833589") && decoded.accepts[0].payTo === WALLET.PAY_TO, decoded);
+  && decoded.accepts[0].asset.startsWith("0x833589") && decoded.accepts[0].payTo === WALLET.PAY_TO
+  && decoded.extensions.bazaar.info.input.method === "POST"
+  && decoded.extensions.bazaar.info.output.type === "json", decoded);
 
 const rpc = (body, env = {}, hdrs = {}) => call("/mcp", {
   method: "POST", headers: { "content-type": "application/json", ...hdrs }, body: JSON.stringify(body) }, env);

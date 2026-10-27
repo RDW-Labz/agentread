@@ -20,7 +20,7 @@ function b64(obj) {
 }
 
 // x402 v2 canonical 402: base64 PaymentRequired in a `payment-required` header (+ body for v1 clients)
-function challenge({ priceUsd, payTo, reqUrl, method, description }) {
+function challenge({ priceUsd, payTo, reqUrl, method, description, bazaarIn, bazaarOut }) {
   const payload = {
     x402Version: 2,
     resource: { url: reqUrl, method, description, mimeType: "application/json",
@@ -34,6 +34,8 @@ function challenge({ priceUsd, payTo, reqUrl, method, description }) {
       maxTimeoutSeconds: 300,
       extra: { name: "USD Coin", version: "2" },
     }],
+    // bazaar = x402's discovery layer: this is what makes the endpoint appear in /discovery/resources
+    extensions: { bazaar: { info: { input: bazaarIn, output: bazaarOut } } },
   };
   return new Response(JSON.stringify(payload), {
     status: 402,
@@ -173,7 +175,9 @@ function lineDiff(a, b) {
 async function changes(req, env, dry, payTo) {
   if (!req.headers.get("x-payment") && !dry) {
     return challenge({ priceUsd: PRICE_CHANGES, payTo, reqUrl: req.url, method: req.method,
-      description: "What changed on this URL since the last check" });
+      description: "What changed on this URL since the last check",
+      bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
+      bazaarOut: { type: "json", example: { first_check: true, changed: null, baseline_chars: 171 } } });
   }
   const b = await req.json().catch(() => ({}));
   const target = b.url;
@@ -337,7 +341,10 @@ async function mcp(req, dry, charge, payTo, ctx) {
     case "tools/call": {
       if (!req.headers.get("x-payment") && !dry) {
         return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
-          description: "Read a URL your own fetch failed on" });
+          description: "Read a URL your own fetch failed on",
+          bazaarIn: { type: "mcp", toolName: "read", inputSchema: MCP_TOOL.inputSchema,
+                      transport: "streamable-http", example: { url: "https://example.com/" } },
+          bazaarOut: { type: "json", example: { verdict: "readable", chars: 171 } } });
       }
       const a = (msg.params || {}).arguments || {};
       const urls = Array.isArray(a.urls)
@@ -374,7 +381,9 @@ export default {
     const charge = +(PRICE * count).toFixed(4);
     if (!req.headers.get("x-payment") && !dry) { // gate before validation, as registries probe it
       return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
-        description: "Read one or more URLs" });
+        description: "Read one or more URLs",
+        bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
+        bazaarOut: { type: "json", example: { verdict: "readable", title: "Example Domain", chars: 171 } } });
     }
     const [code, body] = await runRead({ target, urls }, dry, charge, ctx);
     return json(body, code);
