@@ -8,6 +8,38 @@ const UA = "Mozilla/5.0 (compatible; agentread/0.1; +https://agentread.dev/bot)"
 const MAX_TEXT = 8000;
 const VERSION = "v3"; // bump to bust the edge cache after changing verdict logic
 const PRICE_CHANGES = 0.01;
+const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC, 6 decimals
+const NETWORK = "eip155:8453"; // Base mainnet, CAIP-2
+const SERVICE = "agentread";
+
+function b64(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+// x402 v2 canonical 402: base64 PaymentRequired in a `payment-required` header (+ body for v1 clients)
+function challenge({ priceUsd, payTo, reqUrl, method, description }) {
+  const payload = {
+    x402Version: 2,
+    resource: { url: reqUrl, method, description, mimeType: "application/json",
+                tags: ["agents"], serviceName: SERVICE },
+    accepts: [{
+      scheme: "exact",
+      network: NETWORK,
+      amount: String(Math.round(priceUsd * 1e6)), // atomic units: 0.02 USD -> "20000"
+      asset: USDC_BASE,
+      payTo,
+      maxTimeoutSeconds: 300,
+      extra: { name: "USD Coin", version: "2" },
+    }],
+  };
+  return new Response(JSON.stringify(payload), {
+    status: 402,
+    headers: { "content-type": "application/json", "payment-required": b64(payload) },
+  });
+}
 
 const MANIFEST = {
   name: "agentread",
@@ -140,8 +172,8 @@ function lineDiff(a, b) {
 // "what changed here since I last looked" — the one thing a session-bound agent cannot know
 async function changes(req, env, dry, payTo) {
   if (!req.headers.get("x-payment") && !dry) {
-    return json({ error: "payment_required",
-      accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: PRICE_CHANGES, payTo }] }, 402);
+    return challenge({ priceUsd: PRICE_CHANGES, payTo, reqUrl: req.url, method: req.method,
+      description: "What changed on this URL since the last check" });
   }
   const b = await req.json().catch(() => ({}));
   const target = b.url;
@@ -304,8 +336,8 @@ async function mcp(req, dry, charge, payTo, ctx) {
       return ok({ tools: [MCP_TOOL] });
     case "tools/call": {
       if (!req.headers.get("x-payment") && !dry) {
-        return json({ jsonrpc: "2.0", id, error: { code: -32001, message: "payment_required",
-          data: { accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: charge, payTo }] } } }, 402);
+        return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
+          description: "Read a URL your own fetch failed on" });
       }
       const a = (msg.params || {}).arguments || {};
       const urls = Array.isArray(a.urls)
@@ -340,9 +372,9 @@ export default {
     }
     const count = urls && urls.length ? urls.length : 1;
     const charge = +(PRICE * count).toFixed(4);
-    if (!req.headers.get("x-payment") && !dry) {
-      return json({ error: "payment_required",
-        accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: charge, payTo }] }, 402);
+    if (!req.headers.get("x-payment") && !dry) { // gate before validation, as registries probe it
+      return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
+        description: "Read one or more URLs" });
     }
     const [code, body] = await runRead({ target, urls }, dry, charge, ctx);
     return json(body, code);

@@ -61,7 +61,11 @@ Tested against 9 real sites: **4 returned page text.**
 
 ## Pricing
 
-$0.02 per URL over x402 (USDC on Base). Batches are priced per URL. While `PAY_TO` is unset the service runs free — see `PAY_TO` below.
+$0.02 per URL to read, $0.01 per change check, over x402 (USDC on Base, `eip155:8453`). Batches are priced per URL.
+
+Unpaid calls return HTTP 402 with the canonical x402 v2 challenge: a base64 `PaymentRequired` object in the `payment-required` header, `amount` in USDC atomic units (`"20000"` = $0.02), asset `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`.
+
+Listed on x402scan (`Successfully registered 2 of 2 resources`), merchant page `tryponcho.com/m/agentread.midi-thumb.workers.dev`.
 
 ## Deploy your own
 

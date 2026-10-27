@@ -9,7 +9,7 @@ globalThis.caches = { default: {
 }};
 const call = async (path, opts = {}, env = {}) => {
   const r = await w.fetch(new Request("https://agentread.dev" + path, opts), env, { waitUntil: (p) => p });
-  return [r.status, await r.json()];
+  return [r.status, await r.json(), r];
 };
 const WALLET = { PAY_TO: "0xabc123" }; // turns the paywall on for tests
 let fails = 0;
@@ -18,14 +18,14 @@ const check = (name, cond, extra) => {
   else console.log("PASS", name);
 };
 
-let [s, b] = await call("/mcp");
+let [s, b, resp] = await call("/mcp");
 check("manifest free, priced 0.25", s === 200 && b.tools[0].price === 0.02 && b.tools[0].name === "read", b);
 
 [s, b] = await call("/read?url=notaurl");
 check("rejects bad url", s === 400, b);
 
 [s, b] = await call("/read?url=https://example.com/", {}, WALLET);
-check("402 without payment", s === 402 && b.accepts[0].amount === 0.02, b);
+check("402 without payment", s === 402 && b.accepts[0].amount === "20000" && b.x402Version === 2, b);
 
 [s, b] = await call("/read?url=https://example.com/", { headers: { "x-payment": "stub" } }, WALLET);
 check("paid returns page text", s === 200 && b.verdict === "readable" && b.text.length > 40 && b.cached === false, b);
@@ -45,9 +45,15 @@ check("blocked site: verdict + route, no text", s === 200 && b.verdict === "bloc
 check("batch: 3 urls, invalid dropped, charged 0.04",
   s === 200 && b.count === 2 && b.charged === 0.04 && b.results.length === 2, b);
 
-[s, b] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
+[s, b, resp] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ urls: ["https://example.com/"] }) }, WALLET);
-check("batch 402 priced per url", s === 402 && b.accepts[0].amount === 0.02, b);
+check("batch 402 priced per url", s === 402 && b.accepts[0].amount === "20000", b);
+
+const hdr = resp.headers.get("payment-required");
+const decoded = hdr ? JSON.parse(Buffer.from(hdr, "base64").toString("utf8")) : null;
+check("payment-required header is canonical v2",
+  !!decoded && decoded.x402Version === 2 && decoded.accepts[0].network === "eip155:8453"
+  && decoded.accepts[0].asset.startsWith("0x833589") && decoded.accepts[0].payTo === WALLET.PAY_TO, decoded);
 
 const rpc = (body, env = {}, hdrs = {}) => call("/mcp", {
   method: "POST", headers: { "content-type": "application/json", ...hdrs }, body: JSON.stringify(body) }, env);
@@ -65,7 +71,7 @@ check("mcp tools/call returns page text", s === 200 && mcpOut.verdict === "reada
 
 [s, b] = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/call",
   params: { name: "read", arguments: { url: "https://example.org/" } } }, WALLET);
-check("mcp tools/call gated by payment", s === 402 && b.error.code === -32001, b);
+check("mcp tools/call gated by payment", s === 402 && b.accepts[0].amount === "20000", b);
 
 [s, b] = await rpc({ jsonrpc: "2.0", id: 5, method: "does/not/exist" });
 check("mcp unknown method", s === 200 && b.error.code === -32601, b);
@@ -99,7 +105,7 @@ check("changes: line gone from the page is reported as removed",
 
 [s, b] = await call("/changes", { method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ url: "https://example.com/" }) }, { ...KV, PAY_TO: "0xabc" });
-check("changes: gated by payment", s === 402 && b.accepts[0].amount === 0.01, b);
+check("changes: gated by payment", s === 402 && b.accepts[0].amount === "10000", b);
 
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);
