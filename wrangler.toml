@@ -1,0 +1,7 @@
+name = "agentread"
+main = "worker.js"
+compatibility_date = "2026-10-19"
+
+[[kv_namespaces]]
+binding = "AGENTREAD_KV"
+id = "25b80303d7cf4ca2bf8a6c2e6bd5c664"

@@ -70,5 +70,36 @@ check("mcp tools/call gated by payment", s === 402 && b.error.code === -32001, b
 [s, b] = await rpc({ jsonrpc: "2.0", id: 5, method: "does/not/exist" });
 check("mcp unknown method", s === 200 && b.error.code === -32601, b);
 
+// ---- changes (stateful, needs a KV stub) ----
+const kvstore = new Map();
+const KV = { AGENTREAD_KV: {
+  get: async (k, type) => {
+    const v = kvstore.get(k);
+    if (v === undefined) return null;
+    return type === "json" ? JSON.parse(v) : v;
+  },
+  put: async (k, v) => { kvstore.set(k, String(v)); },
+}};
+const chg = (url) => call("/changes", { method: "POST",
+  headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) }, KV);
+
+[s, b] = await chg("https://example.com/");
+check("changes: first call stores baseline", s === 200 && b.first_check === true && b.changed === null, b);
+
+[s, b] = await chg("https://example.com/");
+check("changes: unchanged page reports changed=false", s === 200 && b.first_check === false && b.changed === false, b);
+
+const k = "changes:v1:https://example.com/";
+const stored = JSON.parse(kvstore.get(k));
+kvstore.set(k, JSON.stringify({ hash: "deadbeef", text: stored.text + "\nBRAND NEW LINE", at: stored.at }));
+[s, b] = await chg("https://example.com/");
+check("changes: line gone from the page is reported as removed",
+  s === 200 && b.changed === true && b.removed_count === 1 && b.added_count === 0
+  && b.removed[0].includes("BRAND NEW LINE"), b);
+
+[s, b] = await call("/changes", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ url: "https://example.com/" }) }, { ...KV, PAY_TO: "0xabc" });
+check("changes: gated by payment", s === 402 && b.accepts[0].amount === 0.01, b);
+
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);

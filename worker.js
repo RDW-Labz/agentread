@@ -7,6 +7,7 @@ const PAY_TO = ZERO; // set via wrangler var PAY_TO=<wallet> to start charging
 const UA = "Mozilla/5.0 (compatible; agentread/0.1; +https://agentread.dev/bot)";
 const MAX_TEXT = 8000;
 const VERSION = "v3"; // bump to bust the edge cache after changing verdict logic
+const PRICE_CHANGES = 0.01;
 
 const MANIFEST = {
   name: "agentread",
@@ -20,6 +21,14 @@ const MANIFEST = {
       "robots_disallowed) and the recommended route. Paid per call via x402. " +
       "POST {urls:[...]} checks up to 40 URLs in one paid call.",
     args: { url: "https://example.com/page", urls: ["https://a.example", "https://b.example"] },
+  }, {
+    name: "changes",
+    price: PRICE_CHANGES,
+    description:
+      "What changed on this URL since the last check. First call stores a baseline and returns " +
+      "first_check; later calls return changed plus the added and removed lines. Use it for " +
+      "monitoring across sessions, which an agent cannot do itself. Paid per call via x402.",
+    args: { url: "https://example.com/page" },
   }],
 };
 
@@ -112,6 +121,57 @@ export async function readPage(urlStr, doFetch = fetch) {
   };
 }
 
+function hash(s) { // FNV-1a, enough to detect "did this text change"
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(16);
+}
+
+function lineDiff(a, b) {
+  const al = a.split("\n").map((s) => s.trim()).filter(Boolean);
+  const bl = b.split("\n").map((s) => s.trim()).filter(Boolean);
+  const as = new Set(al), bs = new Set(bl);
+  const added = bl.filter((l) => !as.has(l));
+  const removed = al.filter((l) => !bs.has(l));
+  return { added: added.slice(0, 20), removed: removed.slice(0, 20),
+           added_count: added.length, removed_count: removed.length };
+}
+
+// "what changed here since I last looked" — the one thing a session-bound agent cannot know
+async function changes(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return json({ error: "payment_required",
+      accepts: [{ scheme: "x402", network: "base", asset: "USDC", amount: PRICE_CHANGES, payTo }] }, 402);
+  }
+  const b = await req.json().catch(() => ({}));
+  const target = b.url;
+  if (!target || !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
+
+  const r = await readPage(target);
+  const now = new Date().toISOString();
+  if (r.verdict !== "readable") {
+    return json({ url: target, verdict: r.verdict, recommended_route: r.recommended_route,
+                  changed: null, note: "page unreadable; baseline left untouched" });
+  }
+  const kv = env && env.AGENTREAD_KV;
+  const key = "changes:v1:" + target;
+  const prev = kv ? await kv.get(key, "json") : null;
+  const text = r.text || "";
+  const h = hash(text);
+  const out = { url: target, title: r.title, checked_at: now };
+  if (!prev) {
+    Object.assign(out, { first_check: true, changed: null, baseline_chars: text.length,
+      note: "baseline stored; call again later to learn what changed" });
+  } else {
+    const d = lineDiff(prev.text || "", text);
+    Object.assign(out, { first_check: false, changed: prev.hash !== h, previous_check_at: prev.at,
+      added_count: d.added_count, removed_count: d.removed_count, added: d.added, removed: d.removed });
+  }
+  if (kv) await kv.put(key, JSON.stringify({ hash: h, text: text.slice(0, 8000), at: now }),
+                       { expirationTtl: 60 * 60 * 24 * 30 });
+  return json(out);
+}
+
 function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
 }
@@ -132,6 +192,28 @@ const OPENAPI = {
       "rather than return fabricated content.",
   },
   paths: {
+    "/changes": {
+      post: {
+        operationId: "changes",
+        summary: "What changed on this URL since the last check",
+        requestBody: {
+          required: true,
+          content: { "application/json": { schema: {
+            type: "object",
+            properties: { url: { type: "string", description: "URL to check for changes" } },
+            required: ["url"], additionalProperties: false } } },
+        },
+        responses: {
+          "200": { description: "changed flag plus added/removed lines, or first_check when a baseline was just stored" },
+          "400": { description: "Missing or invalid url" },
+          "402": { description: "Payment Required" },
+        },
+        "x-payment-info": {
+          price: { mode: "fixed", currency: "USD", amount: "0.01" },
+          protocols: [{ x402: {} }],
+        },
+      },
+    },
     "/read": {
       post: {
         operationId: "read",
@@ -246,6 +328,7 @@ export default {
     if (path === "/mcp" && req.method === "POST") return mcp(req, dry, PRICE, payTo, ctx); // MCP JSON-RPC
     if (path === "/openapi.json") return json(OPENAPI); // discovery contract for x402 registries
     if (["/", "/mcp", "/llms.txt", "/api/resources.json"].includes(path)) return json(MANIFEST);
+    if (path === "/changes") return changes(req, env, dry, payTo);
     if (path !== "/read") return json({ error: "not found" }, 404);
 
     let target = url.searchParams.get("url");
