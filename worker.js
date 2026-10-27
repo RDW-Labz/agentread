@@ -13,6 +13,8 @@ const PRICE_SNAPGET = 0.01;
 const PRICE_WAIT = 0.02;
 const PRICE_COMPARE = 0.02;
 const PRICE_SEEN = 0.01;
+const PRICE_EXTRACT = 0.01;
+const PRICE_DIFF = 0.01;
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC, 6 decimals
 const NETWORK = "eip155:8453"; // Base mainnet, CAIP-2
 const SERVICE = "agentread";
@@ -103,6 +105,38 @@ const MANIFEST = {
     name: "first_seen", price: PRICE_SEEN,
     description: "When this exact text was first observed at this URL, from stored history. Distinguishes new content from old.",
     args: { url: "https://example.com/page", text: "some exact sentence" },
+  }, {
+    name: "links", price: PRICE_EXTRACT,
+    description: "All links on a page, resolved to absolute URLs. Use for crawling, link audits or finding where something points.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "outline", price: PRICE_EXTRACT,
+    description: "The heading structure of a page (h1-h6 with text). Use to understand a long document without reading it.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "tables", price: PRICE_EXTRACT,
+    description: "HTML tables extracted as JSON arrays of rows. Use for prices, specs, stats and comparison tables.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "jsonld", price: PRICE_EXTRACT,
+    description: "JSON-LD structured data blocks from a page (Product, Article, Event, Organization). Cleanest source of facts on modern sites.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "robots", price: PRICE_EXTRACT,
+    description: "robots.txt rules and declared sitemaps for a site. Check before crawling whether an agent is allowed and where to start.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "sitemap", price: PRICE_EXTRACT,
+    description: "URLs listed in a sitemap, with lastmod. Use to enumerate a site's pages instead of crawling.",
+    args: { url: "https://example.com/sitemap.xml" },
+  }, {
+    name: "feed", price: PRICE_EXTRACT,
+    description: "Latest items from an RSS or Atom feed: title, link, date. Cheapest way to see what is new on a site.",
+    args: { url: "https://example.com/feed.xml" },
+  }, {
+    name: "diff", price: PRICE_DIFF,
+    description: "Diff two texts you already hold. Returns added and removed lines. No fetch, no page needed.",
+    args: { a: "old text", b: "new text" },
   }],
 };
 
@@ -364,6 +398,219 @@ async function firstSeen(req, env, dry, payTo) {
                 note: "first time we have observed this text at this URL" });
 }
 
+// ---- shared plumbing for the extractors ----
+function gate(req, dry, priceUsd, payTo, description, bazaarIn, bazaarOut) {
+  if (req.headers.get("x-payment") || dry) return null;
+  return challenge({ priceUsd, payTo, reqUrl: req.url, method: req.method, description, bazaarIn, bazaarOut });
+}
+
+async function fetchRaw(u) {
+  try {
+    const res = await fetch(u, { headers: { "User-Agent": UA, Accept: "*/*" }, redirect: "follow" });
+    const body = (await res.text()).slice(0, 300000);
+    return { status: res.status, ctype: res.headers.get("content-type") || "", final: res.url || u, body };
+  } catch (e) {
+    return { status: 0, ctype: "", final: u, body: "", error: String(e).slice(0, 120) };
+  }
+}
+
+function needUrl(b) {
+  const u = (b && b.url) || "";
+  return /^https?:\/\//.test(u) ? u : null;
+}
+
+function stripTags(s) {
+  return (s || "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+                  .replace(/\s+/g, " ").trim();
+}
+
+// ---- links ----
+async function linksTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "Extract and resolve links from a page",
+    { type: "http", method: "POST", body: { url: "https://example.com/" } },
+    { type: "json", example: { count: 3, links: ["https://example.com/about"] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = needUrl(b);
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const seen = new Set(), out = [];
+  const re = /<a\b[^>]*?href\s*=\s*["']([^"'#]+)["']/gi;
+  let m;
+  while ((m = re.exec(r.body)) && out.length < 200) {
+    let href = m[1].trim();
+    if (/^(mailto:|javascript:|tel:|data:)/i.test(href)) continue;
+    try { href = new URL(href, r.final).toString(); } catch (e) { continue; }
+    if (!seen.has(href)) { seen.add(href); out.push(href); }
+  }
+  return json({ url: target, count: out.length, links: out });
+}
+
+// ---- outline (heading structure) ----
+async function outlineTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "Heading outline of a page",
+    { type: "http", method: "POST", body: { url: "https://example.com/" } },
+    { type: "json", example: { count: 2, headings: [{ level: 1, text: "Example Domain" }] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = needUrl(b);
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const headings = [];
+  const re = /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi;
+  let m;
+  while ((m = re.exec(r.body)) && headings.length < 100) {
+    const text = stripTags(m[2]);
+    if (text) headings.push({ level: +m[1], text });
+  }
+  return json({ url: target, count: headings.length, headings });
+}
+
+// ---- tables ----
+async function tablesTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "Extract HTML tables as JSON",
+    { type: "http", method: "POST", body: { url: "https://example.com/" } },
+    { type: "json", example: { count: 1, tables: [[["h1", "h2"], ["a", "b"]]] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = needUrl(b);
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const tables = [];
+  const tre = /<table\b[\s\S]*?<\/table>/gi;
+  let tm;
+  while ((tm = tre.exec(r.body)) && tables.length < 5) {
+    const rows = [];
+    const rre = /<tr\b[\s\S]*?<\/tr>/gi;
+    let rm;
+    while ((rm = rre.exec(tm[0])) && rows.length < 50) {
+      const cells = [];
+      const cre = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+      let cm;
+      while ((cm = cre.exec(rm[0])) && cells.length < 20) cells.push(stripTags(cm[1]));
+      if (cells.length) rows.push(cells);
+    }
+    if (rows.length) tables.push(rows);
+  }
+  return json({ url: target, count: tables.length, tables });
+}
+
+// ---- jsonld ----
+async function jsonldTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "Extract JSON-LD structured data",
+    { type: "http", method: "POST", body: { url: "https://example.com/" } },
+    { type: "json", example: { count: 1, blocks: [{ "@type": "Product" }] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = needUrl(b);
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const blocks = [];
+  const re = /<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(r.body)) && blocks.length < 10) {
+    try { blocks.push(JSON.parse(m[1].trim())); } catch (e) { /* skip malformed blocks */ }
+  }
+  return json({ url: target, count: blocks.length, blocks });
+}
+
+// ---- robots ----
+async function robotsTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "robots.txt rules and sitemaps for a site",
+    { type: "http", method: "POST", body: { url: "https://example.com/" } },
+    { type: "json", example: { found: true, sitemaps: ["https://example.com/sitemap.xml"] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = needUrl(b);
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const origin = new URL(target).origin;
+  const r = await fetchRaw(origin + "/robots.txt");
+  const found = r.status === 200 && r.body.trim().length > 0;
+  const sitemaps = [], disallow = [], allow = [];
+  if (found) {
+    let applies = false;
+    for (const raw of r.body.split("\n")) {
+      const line = raw.split("#")[0].trim();
+      const m = line.match(/^([A-Za-z-]+)\s*:\s*(.*)$/);
+      if (!m) continue;
+      const k = m[1].toLowerCase(), v = m[2].trim();
+      if (k === "user-agent") applies = v === "*" || /agentread|bot/i.test(v);
+      else if (k === "sitemap") sitemaps.push(v);
+      else if (applies && k === "disallow" && v) disallow.push(v);
+      else if (applies && k === "allow" && v) allow.push(v);
+    }
+  }
+  return json({ origin, found, sitemaps: sitemaps.slice(0, 20),
+                disallow: disallow.slice(0, 100), allow: allow.slice(0, 50) });
+}
+
+// ---- sitemap ----
+async function sitemapTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "List URLs from a sitemap",
+    { type: "http", method: "POST", body: { url: "https://example.com/sitemap.xml" } },
+    { type: "json", example: { count: 12, urls: [{ loc: "https://example.com/a", lastmod: "2026-10-01" }] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = b.url && /^https?:\/\//.test(b.url) ? b.url : null;
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const urls = [];
+  const re = /<url>([\s\S]*?)<\/url>/gi;
+  let m;
+  while ((m = re.exec(r.body)) && urls.length < 500) {
+    const loc = (m[1].match(/<loc>([\s\S]*?)<\/loc>/i) || [])[1];
+    const lastmod = (m[1].match(/<lastmod>([\s\S]*?)<\/lastmod>/i) || [])[1];
+    if (loc) urls.push({ loc: loc.trim(), lastmod: lastmod ? lastmod.trim() : null });
+  }
+  return json({ url: target, count: urls.length, urls });
+}
+
+// ---- feed ----
+async function feedTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_EXTRACT, payTo, "Latest items from an RSS or Atom feed",
+    { type: "http", method: "POST", body: { url: "https://example.com/feed.xml" } },
+    { type: "json", example: { count: 2, items: [{ title: "Post", link: "https://example.com/p" }] } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  const target = b.url && /^https?:\/\//.test(b.url) ? b.url : null;
+  if (!target) return json({ error: "url required (http/https)" }, 400);
+  const r = await fetchRaw(target);
+  if (r.status >= 400 || !r.body) return json({ url: target, status: r.status, error: "unreadable" }, 422);
+  const items = [];
+  const re = /<(item|entry)\b[\s\S]*?<\/\1>/gi;
+  let m;
+  while ((m = re.exec(r.body)) && items.length < 20) {
+    const blk = m[0];
+    const title = (blk.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+    const link = (blk.match(/<link[^>]*href=["']([^"']+)["']/i) || [])[1] ||
+                 (blk.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1];
+    const date = (blk.match(/<(pubDate|updated|published)[^>]*>([\s\S]*?)<\/\1>/i) || [])[2];
+    items.push({ title: title ? stripTags(title) : null,
+                 link: link ? stripTags(link) : null,
+                 date: date ? stripTags(date) : null });
+  }
+  return json({ url: target, count: items.length, items });
+}
+
+// ---- diff: two strings the caller supplies, no fetch ----
+async function diffTool(req, env, dry, payTo) {
+  const g = gate(req, dry, PRICE_DIFF, payTo, "Diff two texts you supply",
+    { type: "http", method: "POST", body: { a: "line one", b: "line two" } },
+    { type: "json", example: { same: false, added_count: 1, removed_count: 1 } });
+  if (g) return g;
+  const b = await req.json().catch(() => ({}));
+  if (typeof b.a !== "string" || typeof b.b !== "string") return json({ error: "a and b must be strings" }, 400);
+  const d = lineDiff(b.a, b.b);
+  return json({ same: d.added_count === 0 && d.removed_count === 0,
+                added_count: d.added_count, removed_count: d.removed_count,
+                added: d.added, removed: d.removed });
+}
+
 function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
 }
@@ -384,6 +631,86 @@ const OPENAPI = {
       "rather than return fabricated content.",
   },
   paths: {
+    "/links": {
+      post: {
+        operationId: "links",
+        summary: "Extract and resolve links from a page",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Absolute links found on the page" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/outline": {
+      post: {
+        operationId: "outline",
+        summary: "Heading outline of a page",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Heading levels and text" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/tables": {
+      post: {
+        operationId: "tables",
+        summary: "Extract HTML tables as JSON",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Array of tables, each an array of rows" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/jsonld": {
+      post: {
+        operationId: "jsonld",
+        summary: "Extract JSON-LD structured data",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Parsed JSON-LD blocks" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/robots": {
+      post: {
+        operationId: "robots",
+        summary: "robots.txt rules and sitemaps",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Rules for automated agents plus sitemap URLs" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/sitemap": {
+      post: {
+        operationId: "sitemap",
+        summary: "List URLs from a sitemap",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Sitemap entries with lastmod" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/feed": {
+      post: {
+        operationId: "feed",
+        summary: "Latest items from an RSS or Atom feed",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Feed items with title, link and date" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/diff": {
+      post: {
+        operationId: "diff",
+        summary: "Diff two texts you supply",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { a: { type: "string" }, b: { type: "string" } }, required: ["a", "b"], additionalProperties: false } } } },
+        responses: { "200": { description: "Added and removed lines" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
     "/snapshot": {
       post: {
         operationId: "snapshot",
@@ -507,6 +834,14 @@ const MCP_TOOLS = [
       type: "object", properties: { url_a: { type: "string" }, url_b: { type: "string" } }, required: ["url_a", "url_b"] } },
   { name: "first_seen", description: "When this exact text was first observed at this URL, from stored history. Tells you whether content is new or has been there a while.", inputSchema: {
       type: "object", properties: { url: { type: "string" }, text: { type: "string" } }, required: ["url", "text"] } },
+  { name: "links", description: "All links on a page, resolved to absolute URLs.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "outline", description: "Heading structure of a page (h1-h6 with text).", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "tables", description: "HTML tables extracted as JSON arrays of rows.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "jsonld", description: "JSON-LD structured data blocks from a page.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "robots", description: "robots.txt rules and declared sitemaps for a site.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "sitemap", description: "URLs listed in a sitemap, with lastmod.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "feed", description: "Latest items from an RSS or Atom feed.", inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "diff", description: "Diff two texts you hold; returns added and removed lines.", inputSchema: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } }, required: ["a", "b"] } },
 ];
 
 // one read path, used by both the REST route and MCP tools/call
@@ -568,7 +903,9 @@ async function mcp(req, env, dry, charge, payTo, ctx) {
         return ok({ content: [{ type: "text", text: JSON.stringify(body) }], isError: code !== 200 });
       }
       const handler = { changes, snapshot, snapshot_get: snapshotGet, wait_until: waitUntil,
-                        compare: compareUrls, first_seen: firstSeen }[name];
+                        compare: compareUrls, first_seen: firstSeen,
+                        links: linksTool, outline: outlineTool, tables: tablesTool, jsonld: jsonldTool,
+                        robots: robotsTool, sitemap: sitemapTool, feed: feedTool, diff: diffTool }[name];
       if (!handler) return json({ jsonrpc: "2.0", id, error: { code: -32602, message: "unknown tool: " + name } }, 200);
       // reuse the REST handler by handing it the same arguments as a POST body
       const synth = new Request("https://agentread.internal/mcp", { method: "POST", headers: req.headers,
@@ -598,6 +935,14 @@ export default {
     if (path === "/wait") return waitUntil(req, env, dry, payTo);
     if (path === "/compare") return compareUrls(req, env, dry, payTo);
     if (path === "/first-seen") return firstSeen(req, env, dry, payTo);
+    if (path === "/links") return linksTool(req, env, dry, payTo);
+    if (path === "/outline") return outlineTool(req, env, dry, payTo);
+    if (path === "/tables") return tablesTool(req, env, dry, payTo);
+    if (path === "/jsonld") return jsonldTool(req, env, dry, payTo);
+    if (path === "/robots") return robotsTool(req, env, dry, payTo);
+    if (path === "/sitemap") return sitemapTool(req, env, dry, payTo);
+    if (path === "/feed") return feedTool(req, env, dry, payTo);
+    if (path === "/diff") return diffTool(req, env, dry, payTo);
     if (path !== "/read") return json({ error: "not found" }, 404);
 
     let target = url.searchParams.get("url");

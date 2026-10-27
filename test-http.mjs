@@ -135,11 +135,41 @@ check("first_seen: first sighting is new", s === 200 && b.is_new === true && b.f
 check("first_seen: second sighting reports age", s === 200 && b.is_new === false && b.first_seen, b);
 
 [s, b] = await rpc({ jsonrpc: "2.0", id: 9, method: "tools/list" });
-check("mcp exposes all 7 tools", s === 200 && b.result.tools.length === 7, b.result.tools.map(t=>t.name));
+check("mcp exposes all 15 tools", s === 200 && b.result.tools.length === 15, b.result.tools.map(t=>t.name));
 
 [s, b] = await rpc({ jsonrpc: "2.0", id: 10, method: "tools/call",
   params: { name: "compare", arguments: { url_a: "https://example.com/", url_b: "https://example.org/" } } });
 check("mcp can call compare", s === 200 && typeof JSON.parse(b.result.content[0].text).same === "boolean", b);
+
+// ---- extractors ----
+[s, b] = await J("/links", { url: "https://en.wikipedia.org/wiki/Model_Context_Protocol" });
+check("links resolves absolute urls", s === 200 && b.count >= 5 && b.links.every(l => l.startsWith("http")), { count: b.count });
+
+[s, b] = await J("/outline", { url: "https://en.wikipedia.org/wiki/Model_Context_Protocol" });
+check("outline returns headings", s === 200 && b.count > 5 && b.headings[0].level >= 1, { count: b.count });
+
+[s, b] = await J("/tables", { url: "https://en.wikipedia.org/wiki/Model_Context_Protocol" });
+check("tables returns arrays of rows", s === 200 && Array.isArray(b.tables), { count: b.count });
+
+[s, b] = await J("/jsonld", { url: "https://en.wikipedia.org/wiki/Model_Context_Protocol" });
+check("jsonld returns array", s === 200 && Array.isArray(b.blocks), { count: b.count });
+
+[s, b] = await J("/robots", { url: "https://en.wikipedia.org/wiki/Model_Context_Protocol" });
+check("robots finds rules and sitemaps", s === 200 && b.found === true && b.sitemaps.length >= 1, b);
+
+[s, b] = await J("/sitemap", { url: "https://www.cloudflare.com/sitemap.xml" });
+check("sitemap returns entries", s === 200 && b.count > 0 && b.urls[0].loc, { count: b.count });
+
+[s, b] = await J("/feed", { url: "https://www.theguardian.com/world/rss" }); // HN blocks datacenter IPs
+check("feed parses items", s === 200 && b.count > 0 && b.items[0].link, { count: b.count, first: b.items && b.items[0] });
+
+[s, b] = await J("/diff", { a: "one\ntwo", b: "one\nthree" });
+check("diff reports a change", s === 200 && b.same === false && b.added_count === 1 && b.removed_count === 1, b);
+[s, b] = await J("/diff", { a: "same", b: "same" });
+check("diff identical texts", s === 200 && b.same === true, b);
+
+[s, b] = await rpc({ jsonrpc: "2.0", id: 11, method: "tools/list" });
+check("mcp exposes 15 tools", s === 200 && b.result.tools.length === 15, b.result.tools.map(t => t.name));
 
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);
