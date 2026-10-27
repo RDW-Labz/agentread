@@ -8,6 +8,11 @@ const UA = "Mozilla/5.0 (compatible; agentread/0.1; +https://agentread.dev/bot)"
 const MAX_TEXT = 8000;
 const VERSION = "v3"; // bump to bust the edge cache after changing verdict logic
 const PRICE_CHANGES = 0.01;
+const PRICE_SNAPSHOT = 0.01;
+const PRICE_SNAPGET = 0.01;
+const PRICE_WAIT = 0.02;
+const PRICE_COMPARE = 0.02;
+const PRICE_SEEN = 0.01;
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC, 6 decimals
 const NETWORK = "eip155:8453"; // Base mainnet, CAIP-2
 const SERVICE = "agentread";
@@ -20,6 +25,21 @@ function b64(obj) {
 }
 
 // x402 v2 canonical 402: base64 PaymentRequired in a `payment-required` header (+ body for v1 clients)
+function bazaarSchema(bazaarIn) {
+  const props = { type: { const: bazaarIn.type } };
+  if (bazaarIn.method) props.method = { const: bazaarIn.method };
+  if (bazaarIn.toolName) props.toolName = { const: bazaarIn.toolName };
+  return {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: {
+      input: { type: "object", properties: props, required: ["type"], additionalProperties: true },
+      output: { type: "object", additionalProperties: true },
+    },
+    required: ["input"],
+  };
+}
+
 function challenge({ priceUsd, payTo, reqUrl, method, description, bazaarIn, bazaarOut }) {
   const payload = {
     x402Version: 2,
@@ -35,7 +55,7 @@ function challenge({ priceUsd, payTo, reqUrl, method, description, bazaarIn, baz
       extra: { name: "USD Coin", version: "2" },
     }],
     // bazaar = x402's discovery layer: this is what makes the endpoint appear in /discovery/resources
-    extensions: { bazaar: { info: { input: bazaarIn, output: bazaarOut } } },
+    extensions: { bazaar: { info: { input: bazaarIn, output: bazaarOut }, schema: bazaarSchema(bazaarIn) } },
   };
   return new Response(JSON.stringify(payload), {
     status: 402,
@@ -63,6 +83,26 @@ const MANIFEST = {
       "first_check; later calls return changed plus the added and removed lines. Use it for " +
       "monitoring across sessions, which an agent cannot do itself. Paid per call via x402.",
     args: { url: "https://example.com/page" },
+  }, {
+    name: "snapshot", price: PRICE_SNAPSHOT,
+    description: "Archive a page's text with a timestamp and hash, so you can prove later what it said. Returns a snapshot_id.",
+    args: { url: "https://example.com/page" },
+  }, {
+    name: "snapshot_get", price: PRICE_SNAPGET,
+    description: "Retrieve an archived snapshot by id: original text, title and capture time.",
+    args: { id: "a1b2c3d4e5f6a7b8" },
+  }, {
+    name: "wait_until", price: PRICE_WAIT,
+    description: "Block until a page contains a string and return, up to 25 seconds. Saves the caller from sleeping and re-fetching.",
+    args: { url: "https://example.com/page", contains: "in stock", max_seconds: 20 },
+  }, {
+    name: "compare", price: PRICE_COMPARE,
+    description: "Diff the visible text of two URLs; returns added and removed lines.",
+    args: { url_a: "https://a.example", url_b: "https://b.example" },
+  }, {
+    name: "first_seen", price: PRICE_SEEN,
+    description: "When this exact text was first observed at this URL, from stored history. Distinguishes new content from old.",
+    args: { url: "https://example.com/page", text: "some exact sentence" },
   }],
 };
 
@@ -158,7 +198,7 @@ export async function readPage(urlStr, doFetch = fetch) {
 function hash(s) { // FNV-1a, enough to detect "did this text change"
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
-  return (h >>> 0).toString(16);
+  return (h >>> 0).toString(16).padStart(8, "0"); // fixed width so concatenated ids are predictable
 }
 
 function lineDiff(a, b) {
@@ -208,6 +248,122 @@ async function changes(req, env, dry, payTo) {
   return json(out);
 }
 
+// ---- snapshot: archive a page so its text can be proven later ----
+async function snapshot(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return challenge({ priceUsd: PRICE_SNAPSHOT, payTo, reqUrl: req.url, method: req.method,
+      description: "Archive a page's text with a timestamp and hash",
+      bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
+      bazaarOut: { type: "json", example: { snapshot_id: "a1b2c3d4e5f6a7b8", chars: 171, at: "2026-10-27T18:00:00Z" } } });
+  }
+  const b = await req.json().catch(() => ({}));
+  const target = b.url;
+  if (!target || !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
+
+  const r = await readPage(target);
+  if (r.verdict !== "readable") {
+    return json({ url: target, verdict: r.verdict, recommended_route: r.recommended_route, note: "nothing archived" });
+  }
+  const at = new Date().toISOString();
+  const text = (r.text || "").slice(0, MAX_TEXT);
+  const id = (hash(target + "|" + text + "|" + at) + hash(at + "|" + target)).slice(0, 16); // 64 bits so ids do not collide across users
+  const rec = { snapshot_id: id, url: target, title: r.title, at, chars: text.length, hash: hash(text), text };
+  const kv = env && env.AGENTREAD_KV;
+  if (kv) await kv.put("snap:" + id, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 90 });
+  return json({ snapshot_id: id, url: target, title: r.title, at, chars: text.length,
+                hash: rec.hash, preview: text.slice(0, 200) });
+}
+
+async function snapshotGet(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return challenge({ priceUsd: PRICE_SNAPGET, payTo, reqUrl: req.url, method: req.method,
+      description: "Retrieve an archived snapshot by id",
+      bazaarIn: { type: "http", method: "POST", body: { id: "a1b2c3d4e5f6a7b8" } },
+      bazaarOut: { type: "json", example: { snapshot_id: "a1b2c3d4e5f6a7b8", text: "…" } } });
+  }
+  let id = new URL(req.url).searchParams.get("id");
+  if (req.method === "POST") id = (await req.json().catch(() => ({}))).id || id;
+  if (!id) return json({ error: "id required" }, 400);
+  const kv = env && env.AGENTREAD_KV;
+  const rec = kv ? await kv.get("snap:" + id, "json") : null;
+  if (!rec) return json({ error: "unknown or expired snapshot", id }, 404);
+  return json(rec);
+}
+
+// ---- wait_until: block until the page says what the caller is waiting for ----
+async function waitUntil(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return challenge({ priceUsd: PRICE_WAIT, payTo, reqUrl: req.url, method: req.method,
+      description: "Block until a page contains a string, then return",
+      bazaarIn: { type: "http", method: "POST",
+                  body: { url: "https://example.com/", contains: "in stock", max_seconds: 20 } },
+      bazaarOut: { type: "json", example: { matched: true, waited_ms: 6100, attempts: 3 } } });
+  }
+  const b = await req.json().catch(() => ({}));
+  const target = b.url, needle = b.contains;
+  if (!target || !needle) return json({ error: "url and contains required" }, 400);
+  const maxS = Math.min(Number(b.max_seconds) || 20, 25); // shortcut: 25s ceiling keeps us inside worker limits
+  const started = Date.now();
+  let attempts = 0, lastVerdict = null;
+  while (Date.now() - started < maxS * 1000) {
+    attempts++;
+    const r = await readPage(target);
+    lastVerdict = r.verdict;
+    if (r.verdict === "readable" && (r.text || "").includes(needle)) {
+      return json({ matched: true, waited_ms: Date.now() - started, attempts, chars: r.chars });
+    }
+    if (Date.now() - started + 3000 >= maxS * 1000) break;
+    await new Promise((res) => setTimeout(res, 3000));
+  }
+  return json({ matched: false, waited_ms: Date.now() - started, attempts, verdict: lastVerdict });
+}
+
+// ---- compare: diff two live pages ----
+async function compareUrls(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return challenge({ priceUsd: PRICE_COMPARE, payTo, reqUrl: req.url, method: req.method,
+      description: "Diff the text of two URLs",
+      bazaarIn: { type: "http", method: "POST",
+                  body: { url_a: "https://example.com/", url_b: "https://example.org/" } },
+      bazaarOut: { type: "json", example: { same: false, added_count: 2, removed_count: 1 } } });
+  }
+  const b = await req.json().catch(() => ({}));
+  if (!b.url_a || !b.url_b) return json({ error: "url_a and url_b required" }, 400);
+  const [ra, rb] = await Promise.all([readPage(b.url_a), readPage(b.url_b)]);
+  if (ra.verdict !== "readable" || rb.verdict !== "readable") {
+    return json({ error: "one or both pages unreadable", a: ra.verdict, b: rb.verdict }, 422);
+  }
+  const d = lineDiff(ra.text || "", rb.text || "");
+  return json({ same: d.added_count === 0 && d.removed_count === 0,
+                added_count: d.added_count, removed_count: d.removed_count,
+                added: d.added, removed: d.removed });
+}
+
+// ---- first_seen: when did this text first appear here (from our own history) ----
+async function firstSeen(req, env, dry, payTo) {
+  if (!req.headers.get("x-payment") && !dry) {
+    return challenge({ priceUsd: PRICE_SEEN, payTo, reqUrl: req.url, method: req.method,
+      description: "When this exact text was first observed at this URL",
+      bazaarIn: { type: "http", method: "POST",
+                  body: { url: "https://example.com/", text: "Example Domain" } },
+      bazaarOut: { type: "json", example: { is_new: false, first_seen: "2026-10-27T18:00:00Z", age_hours: 3.2 } } });
+  }
+  const b = await req.json().catch(() => ({}));
+  const target = b.url, text = (b.text || "").trim();
+  if (!target || !text) return json({ error: "url and text required" }, 400);
+  const kv = env && env.AGENTREAD_KV;
+  const key = "seen:" + hash(target) + ":" + hash(text);
+  const prev = kv ? await kv.get(key, "json") : null;
+  const now = new Date().toISOString();
+  if (prev) {
+    return json({ url: target, text, first_seen: prev.at, is_new: false,
+                  age_hours: +(((Date.now() - Date.parse(prev.at)) / 36e5).toFixed(1)) });
+  }
+  if (kv) await kv.put(key, JSON.stringify({ at: now }), { expirationTtl: 60 * 60 * 24 * 180 });
+  return json({ url: target, text, first_seen: now, is_new: true, age_hours: 0,
+                note: "first time we have observed this text at this URL" });
+}
+
 function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
 }
@@ -228,6 +384,56 @@ const OPENAPI = {
       "rather than return fabricated content.",
   },
   paths: {
+    "/snapshot": {
+      post: {
+        operationId: "snapshot",
+        summary: "Archive a page's text with timestamp and hash",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string", description: "URL to archive" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Snapshot id, timestamp, hash and preview" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/snapshot/get": {
+      post: {
+        operationId: "snapshot_get",
+        summary: "Retrieve an archived snapshot",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { id: { type: "string", description: "Snapshot id" } }, required: ["id"], additionalProperties: false } } } },
+        responses: { "200": { description: "The archived text" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/wait": {
+      post: {
+        operationId: "wait_until",
+        summary: "Block until a page contains a string",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string", description: "URL to poll" }, contains: { type: "string", description: "String to wait for" } }, required: ["url", "contains"], additionalProperties: false } } } },
+        responses: { "200": { description: "matched flag and how long it waited" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.02" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/compare": {
+      post: {
+        operationId: "compare",
+        summary: "Diff two URLs",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url_a: { type: "string", description: "First URL" }, url_b: { type: "string", description: "Second URL" } }, required: ["url_a", "url_b"], additionalProperties: false } } } },
+        responses: { "200": { description: "added/removed lines" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.02" }, protocols: [{ x402: {} }] },
+      },
+    },
+    "/first-seen": {
+      post: {
+        operationId: "first_seen",
+        summary: "When this text was first observed at a URL",
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string", description: "URL" }, text: { type: "string", description: "Exact text" } }, required: ["url", "text"], additionalProperties: false } } } },
+        responses: { "200": { description: "first_seen timestamp and age" }, "400": { description: "Invalid input" }, "402": { description: "Payment Required" } },
+        "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.01" }, protocols: [{ x402: {} }] },
+      },
+    },
     "/changes": {
       post: {
         operationId: "changes",
@@ -284,17 +490,24 @@ const OPENAPI = {
   },
 };
 
-const MCP_TOOL = {
-  name: "read",
-  description: MANIFEST.tools[0].description,
-  inputSchema: {
-    type: "object",
-    properties: {
-      url: { type: "string", description: "The URL to read" },
-      urls: { type: "array", items: { type: "string" }, description: "Up to 40 URLs in one call" },
-    },
-  },
-};
+const MCP_TOOLS = [
+  { name: "read", description: MANIFEST.tools[0].description, inputSchema: {
+      type: "object", properties: {
+        url: { type: "string", description: "The URL to read" },
+        urls: { type: "array", items: { type: "string" }, description: "Up to 40 URLs in one call" } } } },
+  { name: "changes", description: "What changed on a URL since the last check. First call stores a baseline, later calls return changed plus added/removed lines. Survives the caller's session.", inputSchema: {
+      type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "snapshot", description: "Archive a page's text with a timestamp and hash so you can prove later what it said. Returns a snapshot_id for snapshot_get.", inputSchema: {
+      type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+  { name: "snapshot_get", description: "Retrieve an archived snapshot by id, with the original text and the time it was captured.", inputSchema: {
+      type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+  { name: "wait_until", description: "Block until a page contains a string, then return. Up to 25 seconds. Use instead of sleeping and re-fetching yourself.", inputSchema: {
+      type: "object", properties: { url: { type: "string" }, contains: { type: "string" }, max_seconds: { type: "number" } }, required: ["url", "contains"] } },
+  { name: "compare", description: "Diff the visible text of two URLs. Returns added and removed lines.", inputSchema: {
+      type: "object", properties: { url_a: { type: "string" }, url_b: { type: "string" } }, required: ["url_a", "url_b"] } },
+  { name: "first_seen", description: "When this exact text was first observed at this URL, from stored history. Tells you whether content is new or has been there a while.", inputSchema: {
+      type: "object", properties: { url: { type: "string" }, text: { type: "string" } }, required: ["url", "text"] } },
+];
 
 // one read path, used by both the REST route and MCP tools/call
 async function runRead({ target, urls }, dry, charge, ctx) {
@@ -321,7 +534,7 @@ async function runRead({ target, urls }, dry, charge, ctx) {
   return [200, await one(target)];
 }
 
-async function mcp(req, dry, charge, payTo, ctx) {
+async function mcp(req, env, dry, charge, payTo, ctx) {
   const msg = await req.json().catch(() => null);
   const id = msg && msg.id !== undefined ? msg.id : null;
   const ok = (result) => json({ jsonrpc: "2.0", id, result });
@@ -337,20 +550,32 @@ async function mcp(req, dry, charge, payTo, ctx) {
     case "ping":
       return ok({});
     case "tools/list":
-      return ok({ tools: [MCP_TOOL] });
+      return ok({ tools: MCP_TOOLS });
     case "tools/call": {
       if (!req.headers.get("x-payment") && !dry) {
         return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
           description: "Read a URL your own fetch failed on",
-          bazaarIn: { type: "mcp", toolName: "read", inputSchema: MCP_TOOL.inputSchema,
+          bazaarIn: { type: "mcp", toolName: "read", inputSchema: MCP_TOOLS[0].inputSchema,
                       transport: "streamable-http", example: { url: "https://example.com/" } },
           bazaarOut: { type: "json", example: { verdict: "readable", chars: 171 } } });
       }
       const a = (msg.params || {}).arguments || {};
-      const urls = Array.isArray(a.urls)
-        ? a.urls.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)).slice(0, 40) : null;
-      const [code, body] = await runRead({ target: a.url, urls }, dry, charge, ctx);
-      return ok({ content: [{ type: "text", text: JSON.stringify(body) }], isError: code !== 200 });
+      const name = (msg.params || {}).name;
+      if (name === "read") {
+        const urls = Array.isArray(a.urls)
+          ? a.urls.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)).slice(0, 40) : null;
+        const [code, body] = await runRead({ target: a.url, urls }, dry, charge, ctx);
+        return ok({ content: [{ type: "text", text: JSON.stringify(body) }], isError: code !== 200 });
+      }
+      const handler = { changes, snapshot, snapshot_get: snapshotGet, wait_until: waitUntil,
+                        compare: compareUrls, first_seen: firstSeen }[name];
+      if (!handler) return json({ jsonrpc: "2.0", id, error: { code: -32602, message: "unknown tool: " + name } }, 200);
+      // reuse the REST handler by handing it the same arguments as a POST body
+      const synth = new Request("https://agentread.internal/mcp", { method: "POST", headers: req.headers,
+                                                                    body: JSON.stringify(a) });
+      const res = await handler(synth, env, dry, payTo);
+      const out = await res.json();
+      return ok({ content: [{ type: "text", text: JSON.stringify(out) }], isError: res.status >= 400 });
     }
     default:
       return json({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } }, 200);
@@ -364,10 +589,15 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname;
 
-    if (path === "/mcp" && req.method === "POST") return mcp(req, dry, PRICE, payTo, ctx); // MCP JSON-RPC
+    if (path === "/mcp" && req.method === "POST") return mcp(req, env, dry, PRICE, payTo, ctx); // MCP JSON-RPC
     if (path === "/openapi.json") return json(OPENAPI); // discovery contract for x402 registries
     if (["/", "/mcp", "/llms.txt", "/api/resources.json"].includes(path)) return json(MANIFEST);
     if (path === "/changes") return changes(req, env, dry, payTo);
+    if (path === "/snapshot") return snapshot(req, env, dry, payTo);
+    if (path === "/snapshot/get") return snapshotGet(req, env, dry, payTo);
+    if (path === "/wait") return waitUntil(req, env, dry, payTo);
+    if (path === "/compare") return compareUrls(req, env, dry, payTo);
+    if (path === "/first-seen") return firstSeen(req, env, dry, payTo);
     if (path !== "/read") return json({ error: "not found" }, 404);
 
     let target = url.searchParams.get("url");

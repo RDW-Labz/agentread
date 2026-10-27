@@ -109,5 +109,37 @@ check("changes: line gone from the page is reported as removed",
   body: JSON.stringify({ url: "https://example.com/" }) }, { ...KV, PAY_TO: "0xabc" });
 check("changes: gated by payment", s === 402 && b.accepts[0].amount === "10000", b);
 
+// ---- new tool calls ----
+const J = (p, body, env = KV) => call(p, { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify(body) }, env);
+
+[s, b] = await J("/snapshot", { url: "https://example.com/" });
+check("snapshot archives and returns id", s === 200 && /^[0-9a-f]{16}$/.test(b.snapshot_id) && b.chars > 40 && b.hash, b);
+const snapId = b.snapshot_id;
+[s, b] = await J("/snapshot/get", { id: snapId });
+check("snapshot_get returns the archived text", s === 200 && b.snapshot_id === snapId && b.text.length > 40 && b.at, b);
+[s, b] = await J("/snapshot/get", { id: "ffffffffffffffff" });
+check("snapshot_get 404s unknown id", s === 404, b);
+
+[s, b] = await J("/wait", { url: "https://example.com/", contains: "Example Domain", max_seconds: 5 });
+check("wait_until matches immediately", s === 200 && b.matched === true && b.attempts >= 1, b);
+
+[s, b] = await J("/compare", { url_a: "https://example.com/", url_b: "https://example.org/" });
+check("compare returns a diff", s === 200 && typeof b.same === "boolean" && b.added_count >= 0, b);
+[s, b] = await J("/compare", { url_a: "https://example.com/" });
+check("compare validates input", s === 400, b);
+
+[s, b] = await J("/first-seen", { url: "https://example.com/", text: "Example Domain" });
+check("first_seen: first sighting is new", s === 200 && b.is_new === true && b.first_seen, b);
+[s, b] = await J("/first-seen", { url: "https://example.com/", text: "Example Domain" });
+check("first_seen: second sighting reports age", s === 200 && b.is_new === false && b.first_seen, b);
+
+[s, b] = await rpc({ jsonrpc: "2.0", id: 9, method: "tools/list" });
+check("mcp exposes all 7 tools", s === 200 && b.result.tools.length === 7, b.result.tools.map(t=>t.name));
+
+[s, b] = await rpc({ jsonrpc: "2.0", id: 10, method: "tools/call",
+  params: { name: "compare", arguments: { url_a: "https://example.com/", url_b: "https://example.org/" } } });
+check("mcp can call compare", s === 200 && typeof JSON.parse(b.result.content[0].text).same === "boolean", b);
+
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);

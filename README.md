@@ -12,6 +12,12 @@ Base: `https://agentread.midi-thumb.workers.dev`
 |---|---|
 | `GET /read?url=…` | Read one URL |
 | `POST /read {"urls":[…]}` | Read up to 40 in one call |
+| `POST /changes {url}` | What changed since the last check ($0.01) |
+| `POST /snapshot {url}` | Archive a page with timestamp + hash, get a snapshot id ($0.01) |
+| `POST /snapshot/get {id}` | Retrieve an archived snapshot ($0.01) |
+| `POST /wait {url,contains}` | Block until the page matches, up to 25s ($0.02) |
+| `POST /compare {url_a,url_b}` | Diff two live pages ($0.02) |
+| `POST /first-seen {url,text}` | When this text was first observed here ($0.01) |
 | `GET /` · `/mcp` · `/llms.txt` | Free tool manifest |
 
 ```bash
