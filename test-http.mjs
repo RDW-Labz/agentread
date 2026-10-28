@@ -189,5 +189,16 @@ check("preview quota is per ip", s === 200 && b.free_previews_left === 2, b);
 [s, b] = await call("/read?url=https://example.com/", {}, WALLET);
 check("paid routes still 402 after free preview", s === 402, b);
 
+// ---- scraper fallback (only active when a key is configured) ----
+const SCRAPER = { ...KV, SCRAPER_KEY: "test", SCRAPER_TPL: "https://example.com/?k={key}&u={url}" };
+[s, b] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ url: "https://www.nytimes.com/?probe=fb1" }) }, SCRAPER);
+check("blocked page is recovered through the scraper fallback",
+  s === 200 && b.verdict === "readable" && b.recommended_route === "proxy_fallback" && b.evidence.via === "scraper", b);
+
+[s, b] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ url: "https://www.nytimes.com/?probe=fb2" }) }, KV);
+check("without a key the blocked verdict is unchanged", s === 200 && b.verdict === "blocked", b);
+
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);

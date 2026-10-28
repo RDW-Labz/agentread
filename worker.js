@@ -193,7 +193,7 @@ function robotsAllows(txt, path) {
   return { disallowed: false, reason: rules.length ? "path allowed" : "no disallow rule" };
 }
 
-export async function readPage(urlStr, doFetch = fetch) {
+export async function readPage(urlStr, doFetch = fetch, env) {
   const u = new URL(urlStr);
   let robots = { disallowed: false, reason: "no robots.txt" };
   try {
@@ -215,10 +215,30 @@ export async function readPage(urlStr, doFetch = fetch) {
              evidence: { error: String(e).slice(0, 120) } };
   }
 
-  const text = /json|text\/plain|xml/.test(ctype)
+  let text = /json|text\/plain|xml/.test(ctype)
     ? raw.trim().slice(0, MAX_TEXT)
     : visibleText(raw).slice(0, MAX_TEXT);
-  const v = verdictFor({ status, ctype, raw, text, robots });
+  let v = verdictFor({ status, ctype, raw, text, robots });
+
+  // datacenter IP blocked but a scraper key exists: retry through it once
+  if (v.verdict !== "readable" && env) {
+    const alt = scraperUrl(urlStr, env);
+    if (alt) {
+      try {
+        const r2 = await doFetch(alt, { headers: { "User-Agent": UA } });
+        if (r2.ok) {
+          const body2 = (await r2.text()).slice(0, 300000);
+          const text2 = visibleText(body2).slice(0, MAX_TEXT);
+          if (text2.length >= 50) {
+            return { url: urlStr, title: titleOf(body2), text: text2, chars: text2.length,
+                     verdict: "readable", recommended_route: "proxy_fallback", robots_disallowed: !!(robots && robots.disallowed),
+                     evidence: { http_status: 200, content_type: "text/html", bytes: body2.length,
+                                 robots: robots.reason, via: "scraper" } };
+          }
+        }
+      } catch (e) { /* fall through to the blocked verdict */ }
+    }
+  }
   return {
     url: urlStr,
     title: titleOf(raw),
@@ -258,7 +278,7 @@ async function changes(req, env, dry, payTo) {
   const target = b.url;
   if (!target || !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
 
-  const r = await readPage(target);
+  const r = await readPage(target, fetch, env);
   const now = new Date().toISOString();
   if (r.verdict !== "readable") {
     return json({ url: target, verdict: r.verdict, recommended_route: r.recommended_route,
@@ -295,7 +315,7 @@ async function snapshot(req, env, dry, payTo) {
   const target = b.url;
   if (!target || !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
 
-  const r = await readPage(target);
+  const r = await readPage(target, fetch, env);
   if (r.verdict !== "readable") {
     return json({ url: target, verdict: r.verdict, recommended_route: r.recommended_route, note: "nothing archived" });
   }
@@ -342,7 +362,7 @@ async function waitUntil(req, env, dry, payTo) {
   let attempts = 0, lastVerdict = null;
   while (Date.now() - started < maxS * 1000) {
     attempts++;
-    const r = await readPage(target);
+    const r = await readPage(target, fetch, env);
     lastVerdict = r.verdict;
     if (r.verdict === "readable" && (r.text || "").includes(needle)) {
       return json({ matched: true, waited_ms: Date.now() - started, attempts, chars: r.chars });
@@ -364,7 +384,7 @@ async function compareUrls(req, env, dry, payTo) {
   }
   const b = await req.json().catch(() => ({}));
   if (!b.url_a || !b.url_b) return json({ error: "url_a and url_b required" }, 400);
-  const [ra, rb] = await Promise.all([readPage(b.url_a), readPage(b.url_b)]);
+  const [ra, rb] = await Promise.all([readPage(b.url_a, fetch, env), readPage(b.url_b, fetch, env)]);
   if (ra.verdict !== "readable" || rb.verdict !== "readable") {
     return json({ error: "one or both pages unreadable", a: ra.verdict, b: rb.verdict }, 422);
   }
@@ -405,6 +425,14 @@ function gate(req, dry, priceUsd, payTo, description, bazaarIn, bazaarOut) {
   return challenge({ priceUsd, payTo, reqUrl: req.url, method: req.method, description, bazaarIn, bazaarOut });
 }
 
+// Fallback route for pages that block datacenter IPs. Off until SCRAPER_KEY is set.
+function scraperUrl(u, env) {
+  const key = env && env.SCRAPER_KEY;
+  if (!key) return null;
+  const tpl = (env && env.SCRAPER_TPL) || "https://api.scraperapi.com/?api_key={key}&url={url}";
+  return tpl.replace("{key}", key).replace("{url}", encodeURIComponent(u));
+}
+
 async function fetchRaw(u) {
   try {
     const res = await fetch(u, { headers: { "User-Agent": UA, Accept: "*/*" }, redirect: "follow" });
@@ -441,7 +469,7 @@ async function preview(req, env) {
     return json({ error: "preview_limit_reached", used, limit: FREE_PREVIEWS,
                   note: "paid calls are unaffected: POST /read with an x402 payment" }, 429);
   }
-  const r = await readPage(target);
+  const r = await readPage(target, fetch, env);
   if (kv) await kv.put(key, String(used + 1), { expirationTtl: 60 * 60 * 48 });
   return json({ preview: (r.text || "").slice(0, 600), chars: r.chars, verdict: r.verdict,
                 recommended_route: r.recommended_route,
@@ -882,7 +910,7 @@ const MCP_TOOLS = [
 ];
 
 // one read path, used by both the REST route and MCP tools/call
-async function runRead({ target, urls }, dry, charge, ctx) {
+async function runRead({ target, urls }, dry, charge, ctx, env) {
   if (target && !/^https?:\/\//.test(target)) return [400, { error: "url required (http/https)" }];
   if (!target && !(urls && urls.length)) return [400, { error: "url required (http/https)" }];
   const cache = caches.default;
@@ -890,7 +918,7 @@ async function runRead({ target, urls }, dry, charge, ctx) {
     const key = new Request("https://agentread.internal/" + VERSION + "/" + t, { method: "GET" });
     const hit = await cache.match(key);
     if (hit) return { ...(await hit.json()), cached: true };
-    const out = await readPage(t);
+    const out = await readPage(t, fetch, env);
     out.cached = false;
     out.checked_at = new Date().toISOString();
     if (dry) out.dry = true;
@@ -936,7 +964,7 @@ async function mcp(req, env, dry, charge, payTo, ctx) {
       if (name === "read") {
         const urls = Array.isArray(a.urls)
           ? a.urls.filter((u) => typeof u === "string" && /^https?:\/\//.test(u)).slice(0, 40) : null;
-        const [code, body] = await runRead({ target: a.url, urls }, dry, charge, ctx);
+        const [code, body] = await runRead({ target: a.url, urls }, dry, charge, ctx, env);
         return ok({ content: [{ type: "text", text: JSON.stringify(body) }], isError: code !== 200 });
       }
       const handler = { changes, snapshot, snapshot_get: snapshotGet, wait_until: waitUntil,
@@ -998,7 +1026,7 @@ export default {
         bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
         bazaarOut: { type: "json", example: { verdict: "readable", title: "Example Domain", chars: 171 } } });
     }
-    const [code, body] = await runRead({ target, urls }, dry, charge, ctx);
+    const [code, body] = await runRead({ target, urls }, dry, charge, ctx, env);
     return json(body, code);
   },
 };
