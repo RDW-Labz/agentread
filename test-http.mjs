@@ -27,11 +27,15 @@ check("rejects bad url", s === 400, b);
 [s, b] = await call("/read?url=https://example.com/", {}, WALLET);
 check("402 without payment", s === 402 && b.accepts[0].amount === "20000" && b.x402Version === 2, b);
 
-[s, b] = await call("/read?url=https://example.com/", { headers: { "x-payment": "stub" } }, WALLET);
-check("paid returns page text", s === 200 && b.verdict === "readable" && b.text.length > 40 && b.cached === false, b);
+// success paths run in dry mode: a fake header is now rejected by the facilitator check
+[s, b] = await call("/read?url=https://example.com/");
+check("read returns page text", s === 200 && b.verdict === "readable" && b.text.length > 40 && b.cached === false, b);
 
-[s, b] = await call("/read?url=https://example.com/", { headers: { "x-payment": "stub" } }, WALLET);
+[s, b] = await call("/read?url=https://example.com/");
 check("cached on second call", s === 200 && b.cached === true, b);
+
+[s, b] = await call("/read?url=https://example.com/", { headers: { "x-payment": "not-base64" } }, WALLET);
+check("bogus payment header is refused", s === 402 && b.error === "payment_invalid", b);
 
 [s, b] = await call("/read?url=https://example.org/"); // fresh URL, no cache
 check("free when no wallet configured", s === 200 && b.dry === true, b);
@@ -40,10 +44,10 @@ check("free when no wallet configured", s === 200 && b.dry === true, b);
   body: JSON.stringify({ url: "https://www.nytimes.com/" }) });
 check("blocked site: verdict + route, no text", s === 200 && b.verdict === "blocked" && b.text === null && b.recommended_route, b);
 
-[s, b] = await call("/read", { method: "POST", headers: { "x-payment": "stub", "content-type": "application/json" },
-  body: JSON.stringify({ urls: ["https://example.com/", "https://www.nytimes.com/", "not-a-url"] }) }, WALLET);
-check("batch: 3 urls, invalid dropped, charged 0.04",
-  s === 200 && b.count === 2 && b.charged === 0.04 && b.results.length === 2, b);
+[s, b] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ urls: ["https://example.com/", "https://www.nytimes.com/", "not-a-url"] }) });
+check("batch: 3 urls, invalid dropped, priced per url",
+  s === 200 && b.count === 2 && b.charged === 0 && b.results.length === 2, b);
 
 [s, b, resp] = await call("/read", { method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({ urls: ["https://example.com/"] }) }, WALLET);

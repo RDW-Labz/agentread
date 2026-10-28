@@ -70,6 +70,8 @@ Tested against 9 real sites: **4 returned page text.**
 
 $0.02 per URL to read, $0.01 per change check, over x402 (USDC on Base, `eip155:8453`). Batches are priced per URL.
 
+Every paid call is **verified and settled through a facilitator** (`https://x402.dexter.cash` by default, override with `FACILITATOR`): the `payment-signature` payload is POSTed to `/verify`, then `/settle`. A forged or missing payment returns 402 and the work never runs.
+
 Unpaid calls return HTTP 402 with the canonical x402 v2 challenge: a base64 `PaymentRequired` object in the `payment-required` header, `amount` in USDC atomic units (`"20000"` = $0.02), asset `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`.
 
 Listed on x402scan (`Successfully registered 2 of 2 resources`), merchant page `tryponcho.com/m/agentread.midi-thumb.workers.dev`.

@@ -19,6 +19,60 @@ const FREE_PREVIEWS = 3; // per IP per day: nobody pays for something they could
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC, 6 decimals
 const NETWORK = "eip155:8453"; // Base mainnet, CAIP-2
 const SERVICE = "agentread";
+const FACILITATOR_DEFAULT = "https://x402.dexter.cash"; // free public EVM facilitator, no account
+
+// the exact payment terms we ask for; used both to issue the challenge and to verify
+function requirementsFor(priceUsd, payTo, reqUrl, method, description) {
+  return {
+    scheme: "exact", network: NETWORK, amount: String(Math.round(priceUsd * 1e6)),
+    asset: USDC_BASE, payTo, maxTimeoutSeconds: 300,
+    resource: reqUrl, description: description || "", mimeType: "application/json",
+    extra: { name: "USD Coin", version: "2" },
+  };
+}
+
+function b64decode(s) {
+  const bin = atob(s.trim());
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+// Verify the caller's signed payment, then settle it. Returns null when the call is paid for.
+// shortcut: settlement happens before the work, so a failed fetch is not refunded; move settle after
+// the handler if refunds start mattering.
+async function authorized(req, env, dry, priceUsd, payTo, description) {
+  if (dry) return null;
+  const hdr = req.headers.get("payment-signature") || req.headers.get("x-payment");
+  if (!hdr) return { response: challenge({ priceUsd, payTo, reqUrl: req.url, method: req.method, description,
+    bazaarIn: { type: "http", method: req.method, body: {} },
+    bazaarOut: { type: "json", example: {} } }) };
+  let payload;
+  try {
+    payload = JSON.parse(b64decode(hdr));
+  } catch (e) {
+    return { response: json({ error: "payment_invalid", reason: "payment header is not base64 JSON" }, 402) };
+  }
+  const facilitator = (env && env.FACILITATOR) || FACILITATOR_DEFAULT;
+  const paymentRequirements = requirementsFor(priceUsd, payTo, req.url, req.method, description);
+  const call = async (ep) => {
+    try {
+      const r = await fetch(facilitator + ep, { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paymentPayload: payload, paymentRequirements }) });
+      return await r.json();
+    } catch (e) {
+      return { isValid: false, invalidReason: "facilitator_unreachable: " + String(e).slice(0, 80) };
+    }
+  };
+  const v = await call("/verify");
+  if (!v || v.isValid !== true) {
+    return { response: json({ error: "payment_invalid", reason: (v && (v.invalidReason || v.error)) || "rejected" }, 402) };
+  }
+  const s = await call("/settle");
+  if (!s || s.success !== true) {
+    return { response: json({ error: "settlement_failed", reason: (s && (s.errorReason || s.error)) || "unknown" }, 402) };
+  }
+  return null;
+}
 
 function b64(obj) {
   const bytes = new TextEncoder().encode(JSON.stringify(obj));
@@ -221,13 +275,15 @@ export async function readPage(urlStr, doFetch = fetch, env) {
   let v = verdictFor({ status, ctype, raw, text, robots });
 
   // datacenter IP blocked but a scraper key exists: retry through it once
+  let fb = null;
   if (v.verdict !== "readable" && env) {
     const alt = scraperUrl(urlStr, env);
     if (alt) {
       try {
         const r2 = await doFetch(alt, { headers: { "User-Agent": UA } });
+        const raw2 = await r2.text();
         if (r2.ok) {
-          const body2 = (await r2.text()).slice(0, 300000);
+          const body2 = raw2.slice(0, 300000);
           const text2 = visibleText(body2).slice(0, MAX_TEXT);
           if (text2.length >= 50) {
             return { url: urlStr, title: titleOf(body2), text: text2, chars: text2.length,
@@ -235,8 +291,11 @@ export async function readPage(urlStr, doFetch = fetch, env) {
                      evidence: { http_status: 200, content_type: "text/html", bytes: body2.length,
                                  robots: robots.reason, via: "scraper" } };
           }
+          fb = "scraper 200 but no text (" + body2.length + " bytes)";
+        } else {
+          fb = "scraper " + r2.status + ": " + raw2.slice(0, 120).replace(/\s+/g, " ");
         }
-      } catch (e) { /* fall through to the blocked verdict */ }
+      } catch (e) { fb = "scraper error: " + String(e).slice(0, 120); }
     }
   }
   return {
@@ -247,6 +306,7 @@ export async function readPage(urlStr, doFetch = fetch, env) {
     chars: text.length,
     ...v,
     evidence: { http_status: status, content_type: ctype, bytes: raw.length, robots: robots.reason },
+    ...(fb ? { fallback: fb } : {}),
   };
 }
 
@@ -268,7 +328,7 @@ function lineDiff(a, b) {
 
 // "what changed here since I last looked" — the one thing a session-bound agent cannot know
 async function changes(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_CHANGES, payTo, reqUrl: req.url, method: req.method,
       description: "What changed on this URL since the last check",
       bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
@@ -305,7 +365,7 @@ async function changes(req, env, dry, payTo) {
 
 // ---- snapshot: archive a page so its text can be proven later ----
 async function snapshot(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_SNAPSHOT, payTo, reqUrl: req.url, method: req.method,
       description: "Archive a page's text with a timestamp and hash",
       bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
@@ -330,7 +390,7 @@ async function snapshot(req, env, dry, payTo) {
 }
 
 async function snapshotGet(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_SNAPGET, payTo, reqUrl: req.url, method: req.method,
       description: "Retrieve an archived snapshot by id",
       bazaarIn: { type: "http", method: "POST", body: { id: "a1b2c3d4e5f6a7b8" } },
@@ -347,7 +407,7 @@ async function snapshotGet(req, env, dry, payTo) {
 
 // ---- wait_until: block until the page says what the caller is waiting for ----
 async function waitUntil(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_WAIT, payTo, reqUrl: req.url, method: req.method,
       description: "Block until a page contains a string, then return",
       bazaarIn: { type: "http", method: "POST",
@@ -375,7 +435,7 @@ async function waitUntil(req, env, dry, payTo) {
 
 // ---- compare: diff two live pages ----
 async function compareUrls(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_COMPARE, payTo, reqUrl: req.url, method: req.method,
       description: "Diff the text of two URLs",
       bazaarIn: { type: "http", method: "POST",
@@ -396,7 +456,7 @@ async function compareUrls(req, env, dry, payTo) {
 
 // ---- first_seen: when did this text first appear here (from our own history) ----
 async function firstSeen(req, env, dry, payTo) {
-  if (!req.headers.get("x-payment") && !dry) {
+  if (!hasPaid(req) && !dry) {
     return challenge({ priceUsd: PRICE_SEEN, payTo, reqUrl: req.url, method: req.method,
       description: "When this exact text was first observed at this URL",
       bazaarIn: { type: "http", method: "POST",
@@ -665,6 +725,33 @@ async function diffTool(req, env, dry, payTo) {
                 added_count: d.added_count, removed_count: d.removed_count,
                 added: d.added, removed: d.removed });
 }
+
+const hasPaid = (req) => !!(req.headers.get("payment-signature") || req.headers.get("x-payment"));
+
+// price table: the single place that decides what each paid route costs
+const PRICES = {
+  "/read": [PRICE, "Read one or more URLs"],
+  "/changes": [PRICE_CHANGES, "What changed on this URL since the last check"],
+  "/snapshot": [PRICE_SNAPSHOT, "Archive a page's text with a timestamp and hash"],
+  "/snapshot/get": [PRICE_SNAPGET, "Retrieve an archived snapshot by id"],
+  "/wait": [PRICE_WAIT, "Block until a page contains a string, then return"],
+  "/compare": [PRICE_COMPARE, "Diff the text of two URLs"],
+  "/first-seen": [PRICE_SEEN, "When this exact text was first observed at this URL"],
+  "/links": [PRICE_EXTRACT, "Extract and resolve links from a page"],
+  "/outline": [PRICE_EXTRACT, "Heading outline of a page"],
+  "/tables": [PRICE_EXTRACT, "Extract HTML tables as JSON"],
+  "/jsonld": [PRICE_EXTRACT, "Extract JSON-LD structured data"],
+  "/robots": [PRICE_EXTRACT, "robots.txt rules and sitemaps for a site"],
+  "/sitemap": [PRICE_EXTRACT, "List URLs from a sitemap"],
+  "/feed": [PRICE_EXTRACT, "Latest items from an RSS or Atom feed"],
+  "/diff": [PRICE_DIFF, "Diff two texts you supply"],
+};
+const MCP_PRICES = {
+  read: PRICE, changes: PRICE_CHANGES, snapshot: PRICE_SNAPSHOT, snapshot_get: PRICE_SNAPGET,
+  wait_until: PRICE_WAIT, compare: PRICE_COMPARE, first_seen: PRICE_SEEN,
+  links: PRICE_EXTRACT, outline: PRICE_EXTRACT, tables: PRICE_EXTRACT, jsonld: PRICE_EXTRACT,
+  robots: PRICE_EXTRACT, sitemap: PRICE_EXTRACT, feed: PRICE_EXTRACT, diff: PRICE_DIFF,
+};
 
 function json(o, code = 200) {
   return new Response(JSON.stringify(o), { status: code, headers: { "content-type": "application/json" } });
@@ -952,13 +1039,9 @@ async function mcp(req, env, dry, charge, payTo, ctx) {
     case "tools/list":
       return ok({ tools: MCP_TOOLS });
     case "tools/call": {
-      if (!req.headers.get("x-payment") && !dry) {
-        return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
-          description: "Read a URL your own fetch failed on",
-          bazaarIn: { type: "mcp", toolName: "read", inputSchema: MCP_TOOLS[0].inputSchema,
-                      transport: "streamable-http", example: { url: "https://example.com/" } },
-          bazaarOut: { type: "json", example: { verdict: "readable", chars: 171 } } });
-      }
+      const toolPrice = MCP_PRICES[(msg.params || {}).name];
+      const pay = await authorized(req, env, dry, toolPrice || charge, payTo, "agentread tool call: " + (msg.params || {}).name);
+      if (pay) return pay.response;
       const a = (msg.params || {}).arguments || {};
       const name = (msg.params || {}).name;
       if (name === "read") {
@@ -1001,6 +1084,11 @@ export default {
     if (path === "/compare") return compareUrls(req, env, dry, payTo);
     if (path === "/first-seen") return firstSeen(req, env, dry, payTo);
     if (path === "/preview") return preview(req, env); // free, rate-limited
+    const priced = PRICES[path];
+    if (priced) {
+      const pay = await authorized(req, env, dry, priced[0], payTo, priced[1]);
+      if (pay) return pay.response; // 402 challenge, or an explicit verification failure
+    }
     if (path === "/links") return linksTool(req, env, dry, payTo);
     if (path === "/outline") return outlineTool(req, env, dry, payTo);
     if (path === "/tables") return tablesTool(req, env, dry, payTo);
@@ -1020,7 +1108,7 @@ export default {
     }
     const count = urls && urls.length ? urls.length : 1;
     const charge = +(PRICE * count).toFixed(4);
-    if (!req.headers.get("x-payment") && !dry) { // gate before validation, as registries probe it
+    if (!hasPaid(req) && !dry) { // gate before validation, as registries probe it
       return challenge({ priceUsd: charge, payTo, reqUrl: req.url, method: req.method,
         description: "Read one or more URLs",
         bazaarIn: { type: "http", method: "POST", body: { url: "https://example.com/" } },
