@@ -18,6 +18,7 @@ Base: `https://agentread.midi-thumb.workers.dev`
 | `POST /wait {url,contains}` | Block until the page matches, up to 25s ($0.02) |
 | `POST /compare {url_a,url_b}` | Diff two live pages ($0.02) |
 | `POST /first-seen {url,text}` | When this text was first observed here ($0.01) |
+| `POST /preview {url}` | **Free** — first 600 chars, 3/day per IP |
 | `GET /` · `/mcp` · `/llms.txt` | Free tool manifest |
 
 ```bash

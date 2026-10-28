@@ -15,6 +15,7 @@ const PRICE_COMPARE = 0.02;
 const PRICE_SEEN = 0.01;
 const PRICE_EXTRACT = 0.01;
 const PRICE_DIFF = 0.01;
+const FREE_PREVIEWS = 3; // per IP per day: nobody pays for something they could not try
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC, 6 decimals
 const NETWORK = "eip155:8453"; // Base mainnet, CAIP-2
 const SERVICE = "agentread";
@@ -424,6 +425,32 @@ function stripTags(s) {
                   .replace(/\s+/g, " ").trim();
 }
 
+// ---- free preview: let an agent sample before it pays ----
+async function preview(req, env) {
+  const url = new URL(req.url);
+  let target = url.searchParams.get("url");
+  if (req.method === "POST") target = (await req.json().catch(() => ({}))).url || target;
+  if (!target || !/^https?:\/\//.test(target)) return json({ error: "url required (http/https)" }, 400);
+
+  const ip = req.headers.get("cf-connecting-ip") || "unknown";
+  const day = new Date().toISOString().slice(0, 10);
+  const key = "pv:" + ip + ":" + day;
+  const kv = env && env.AGENTREAD_KV;
+  const used = kv ? (Number(await kv.get(key)) || 0) : 0;
+  if (used >= FREE_PREVIEWS) {
+    return json({ error: "preview_limit_reached", used, limit: FREE_PREVIEWS,
+                  note: "paid calls are unaffected: POST /read with an x402 payment" }, 429);
+  }
+  const r = await readPage(target);
+  if (kv) await kv.put(key, String(used + 1), { expirationTtl: 60 * 60 * 48 });
+  return json({ preview: (r.text || "").slice(0, 600), chars: r.chars, verdict: r.verdict,
+                recommended_route: r.recommended_route,
+                free_previews_left: FREE_PREVIEWS - (used + 1),
+                paid_endpoints: ["/read", "/changes", "/snapshot", "/snapshot/get", "/wait",
+                                 "/compare", "/first-seen", "/links", "/outline", "/tables",
+                                 "/jsonld", "/robots", "/sitemap", "/feed", "/diff"] });
+}
+
 // ---- links ----
 async function linksTool(req, env, dry, payTo) {
   const g = gate(req, dry, PRICE_EXTRACT, payTo, "Extract and resolve links from a page",
@@ -631,6 +658,16 @@ const OPENAPI = {
       "rather than return fabricated content.",
   },
   paths: {
+    "/preview": {
+      post: {
+        operationId: "preview",
+        summary: "Free sample: first 600 chars of a page, 3 per day per IP",
+        security: [],
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", properties: { url: { type: "string" } }, required: ["url"], additionalProperties: false } } } },
+        responses: { "200": { description: "Preview text and verdict" }, "429": { description: "Daily preview limit reached" } },
+      },
+    },
     "/links": {
       post: {
         operationId: "links",
@@ -935,6 +972,7 @@ export default {
     if (path === "/wait") return waitUntil(req, env, dry, payTo);
     if (path === "/compare") return compareUrls(req, env, dry, payTo);
     if (path === "/first-seen") return firstSeen(req, env, dry, payTo);
+    if (path === "/preview") return preview(req, env); // free, rate-limited
     if (path === "/links") return linksTool(req, env, dry, payTo);
     if (path === "/outline") return outlineTool(req, env, dry, payTo);
     if (path === "/tables") return tablesTool(req, env, dry, payTo);

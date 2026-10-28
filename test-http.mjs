@@ -171,5 +171,23 @@ check("diff identical texts", s === 200 && b.same === true, b);
 [s, b] = await rpc({ jsonrpc: "2.0", id: 11, method: "tools/list" });
 check("mcp exposes 15 tools", s === 200 && b.result.tools.length === 15, b.result.tools.map(t => t.name));
 
+// ---- free preview quota ----
+const pv = (url, ip) => call("/preview", { method: "POST",
+  headers: { "content-type": "application/json", ...(ip ? { "cf-connecting-ip": ip } : {}) },
+  body: JSON.stringify({ url }) }, KV);
+
+[s, b] = await pv("https://example.com/", "1.1.1.1");
+check("preview is free and returns text", s === 200 && b.preview.length > 20 && b.free_previews_left === 2, b);
+[s, b] = await pv("https://example.com/", "1.1.1.1");
+check("preview counts down", s === 200 && b.free_previews_left === 1, b);
+[s, b] = await pv("https://example.com/", "1.1.1.1");
+check("preview last one", s === 200 && b.free_previews_left === 0, b);
+[s, b] = await pv("https://example.com/", "1.1.1.1");
+check("preview 4th is refused", s === 429 && b.error === "preview_limit_reached", b);
+[s, b] = await pv("https://example.com/", "2.2.2.2");
+check("preview quota is per ip", s === 200 && b.free_previews_left === 2, b);
+[s, b] = await call("/read?url=https://example.com/", {}, WALLET);
+check("paid routes still 402 after free preview", s === 402, b);
+
 console.log(fails ? fails + " failed" : "all pass");
 process.exit(fails ? 1 : 0);
